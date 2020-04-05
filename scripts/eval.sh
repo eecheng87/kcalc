@@ -24,6 +24,7 @@ fromfixed() {
     then
         echo "INF_INT"
     else
+        echo $frac
         echo "$num*(10^$frac)" | bc -l
     fi
 }

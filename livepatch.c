@@ -27,6 +27,30 @@ int livepatch_nop(struct expr_func *f, vec_expr_t args, void *c)
     return 0;
 }
 
+int livepatch_fib(struct expr_func *f, vec_expr_t args, void *c)
+{
+    printk("in livepatch fib\n");
+    //(void) args;
+    (void) c;
+    int n = 10;  // expr_eval(&vec_nth(&args, 0));
+    int a = 0, b = 1;
+    int i = 31 - __builtin_clz(n);
+    for (; i >= 0; i--) {
+        int t1, t2;
+        t1 = a * (b * 2 - a);
+        t2 = b * b + a * a;
+        a = t1;
+        b = t2;
+        if ((n & (1 << i)) > 0) {
+            t1 = a + b;
+            a = b;
+            b = t1;
+        }
+    }
+    printk("expected answer is %d\n", a);
+    return a;
+}
+
 /* clang-format off */
 static struct klp_func funcs[] = {
     {
@@ -36,6 +60,10 @@ static struct klp_func funcs[] = {
     {
         .old_name = "user_func_nop_cleanup",
         .new_func = livepatch_nop_cleanup,
+    },
+    {
+        .old_name = "user_fib",
+        .new_func = livepatch_fib,
     },
     {},
 };
