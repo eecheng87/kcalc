@@ -1,5 +1,4 @@
 #include "expression.h"
-#include "fixed-point.h"
 
 #include <linux/ctype.h> /* for isspace */
 #include <linux/kernel.h>
@@ -7,6 +6,9 @@
 #include <linux/module.h>
 #include <linux/string.h>
 
+#define GET_NUM(n) ((n) >> 4)
+#define NAN_INT ((1 << 4) | ((1 << 4) - 1))
+#define INF_INT ((1 << 5) | ((1 << 4) - 1))
 #define MASK(n) (((n) > 0) << 4)
 /*
  * LSB 4 bits for precision, 2^3, one for sign
@@ -18,18 +20,27 @@
  * Expression data types
  */
 
-static uint64_t GET_NUM(uint64_t n)
+static int GET_FRAC(int n)
 {
-    fixedp num = {.data = n};
-    num.frac = 0;
-    return num.data;
+    int x = n & 15;
+    if (x & 8)
+        return -(((~x) & 15) + 1);
+
+    return x;
 }
 
-static uint64_t GET_FRAC(uint64_t n)
+static int FP2INT(int n, int d)
 {
-    fixedp num = {.data = n};
-    num.inte = 0;
-    return num.data;
+    while (n && n % 10 == 0) {
+        ++d;
+        n /= 10;
+    }
+    if (d == -1) {
+        n *= 10;
+        --d;
+    }
+
+    return ((n << 4) | (d & 15));
 }
 
 static int isNan(int x)
@@ -161,51 +172,28 @@ static enum expr_type expr_op(const char *s, size_t len, int unary)
     return OP_UNKNOWN;
 }
 
-static uint64_t expr_parse_number(const char *s, size_t len)
+static int expr_parse_number(const char *s, size_t len)
 {
-    fixedp num = {0};
+    int num = 0;
     int frac = 0;
     int dot = 0; /* FIXME: not good enough */
     unsigned int digits = 0;
     for (unsigned int i = 0; i < len; i++) {
         if (s[i] == '.' && dot == 0) {
-            dot = i + 1;
+            dot = 1;
             continue;
         }
         if (isdigit(s[i])) {
+            digits++;
             if (dot)
-                frac++;
-            else
-                digits++;
-            // num = num * 10 + (s[i] - '0');
+                --frac;
+            num = num * 10 + (s[i] - '0');
         } else
             return NAN_INT;
     }
 
-    const int pow10[] = {
-        1,      10,      100,      1000,      10000,
-        100000, 1000000, 10000000, 100000000, 1000000000,
-    };
-
-    if (dot) {
-        uint32_t ipt = 0, tmp;
-        uint32_t mask = pow10[frac];
-        int i = 31;
-        sscanf(s, "%u.%u", &tmp, &ipt);
-        while (ipt && i) {
-            ipt <<= 1;
-            if (ipt >= mask) {
-                num.frac |= 1 << i;
-                ipt %= mask;
-            }
-            i--;
-        }
-    }
-
-    if (digits)
-        sscanf(s, "%u", &num.inte);
-
-    return (digits > 0 ? num.data : NAN_INT);
+    num = FP2INT(num, frac);
+    return (digits > 0 ? num : NAN_INT);
 }
 
 /*
@@ -245,116 +233,235 @@ struct expr_var *expr_var(struct expr_var_list *vars, const char *s, size_t len)
     return v;
 }
 
-static uint64_t mult(uint64_t a, uint64_t b)
+static int mult(int a, int b)
 {
-    fixedp fa = {.data = a}, fb = {.data = b};
-    /* (a + b) * (c + d) = ac + ad + bc + bd */
-    fixedp result = {.inte = fa.inte * fb.inte};
-    uint64_t ad = (GET_NUM(a) >> 32) * GET_FRAC(b);
-    uint64_t bc = GET_FRAC(a) * (GET_NUM(b) >> 32);
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    int n3 = n1 * n2;
 
-    return result.data + ad + bc;
+    return FP2INT(n3, (frac1 + frac2));
 }
 
-static uint64_t divid(uint64_t a, uint64_t b)
+static int divid(int a, int b)
 {
-    if (!b) {
-        if (a)
-            return INF_INT;
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    if (n1 == 0 && n2 == 0)
         return NAN_INT;
+    if (n2 == 0)
+        return INF_INT;
+
+    while (n1 * 10 < ((1 << 25) - 1)) {
+        --frac1;
+        n1 *= 10;
+    }
+    int n3 = n1 / n2;
+    int frac3 = frac1 - frac2;
+
+    return FP2INT(n3, frac3);
+}
+
+static int remain(int a, int b)
+{
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    if (n2 == 0)
+        return NAN_INT;
+
+    /* to int */
+    while (frac1 > 0) {
+        n1 /= 10;
+        --frac1;
+    }
+    while (frac2 > 0) {
+        n2 /= 10;
+        --frac2;
     }
 
-    uint64_t result = 0;
-    int shift = __builtin_ctzl(b);
-    b >>= shift;
-    result = a / b;
+    n1 %= n2;
 
-    shift -= 32;
-    if (shift >= 0)
-        return result >> shift;
-    else
-        return result << (-shift);
+    return FP2INT(n1, frac1);
 }
 
-static uint64_t remain(uint64_t a, uint64_t b)
-{
-    a = GET_NUM(a);
-    b = GET_NUM(b);
-
-    if (!b)
-        return NAN_INT;
-
-    return a % b;
-}
-
-static uint64_t right_shift(uint64_t a, int b)
+static int right_shift(int a, int b)
 {
     /* FIXME: should use 2-base? */
-    return a >> b;
+    return divid(a, mult(2 << 4, b));
 }
 
-static uint64_t power(uint64_t a, uint64_t b)
+static int power(int a, int b)
 {
-    uint64_t base = a;
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
 
-    int neg = (b >> 63) & 1;
-    if (neg)
-        b = 0 - b;
-    b >>= 32;
-    for (int i = 1; i < b; i++)
-        a = mult(a, base);
+    while (frac2 != 0) {
+        if (frac2 < 0) {
+            n2 /= 10;
+            ++frac2;
+        } else {
+            n2 *= 10;
+            --frac2;
+        }
+    }
 
-    if (neg) {
-        return divid((uint64_t) 1 << 32, a);
-    } else
-        return a;
+    int on1 = n1;
+    int of1 = frac1;
+    n1 = 1;
+    for (int i = 0; i < n2; ++i) {
+        frac1 += of1;
+        n1 *= on1;
+    }
+    return FP2INT(n1, frac1);
 }
 
-static uint64_t left_shift(uint64_t a, int b)
+static int left_shift(int a, int b)
 {
     /* FIXME: should use 2-base? */
-    return a << b;
+    return mult(a, power(2 << 4, b));
 }
 
-static uint64_t plus(uint64_t a, uint64_t b)
+static int plus(int a, int b)
 {
-    return a + b;
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+
+    while (frac1 != frac2) {
+        if (frac1 > frac2) {
+            --frac1;
+            n1 *= 10;
+        } else if (frac1 < frac2) {
+            --frac2;
+            n2 *= 10;
+        }
+    }
+
+    n1 += n2;
+
+    return FP2INT(n1, frac1);
 }
 
-static uint64_t minus(uint64_t a, uint64_t b)
+static int minus(int a, int b)
 {
-    return a - b;
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+
+    while (frac1 != frac2) {
+        if (frac1 > frac2) {
+            --frac1;
+            n1 *= 10;
+        } else {
+            --frac2;
+            n2 *= 10;
+        }
+    }
+
+    n1 -= n2;
+    return FP2INT(n1, frac1);
 }
 
-static int compare(uint64_t a, uint64_t b)
+static int compare(int a, int b)
 {
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    while (frac1 != frac2) {
+        if (frac1 > frac2) {
+            --frac1;
+            n1 *= 10;
+        } else {
+            --frac2;
+            n2 *= 10;
+        }
+    }
+
     int flags = 0;
-    if (a < b)
+    if (n1 < n2)
         flags |= LOWER;
-    if (a > b)
+    if (n1 > n2)
         flags |= GREATER;
-    if (a == b)
+    if (n1 == n2)
         flags |= EQUAL;
 
     return flags;
 }
 
-static uint64_t not(uint64_t a)
+static int bitwise_op(int a, int b, int op)
 {
-    return !a;
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    if (op == 1 && (a == INF_INT || b == INF_INT))
+        return INF_INT;
+    if (op == 1 && (a == NAN_INT || b == NAN_INT))
+        return 0;
+    if (frac1 == -1 || frac2 == -1)
+        return NAN_INT;
+
+    /* to int */
+    while (frac1 > 0) {
+        n1 /= 10;
+        --frac1;
+    }
+    while (frac2 > 0) {
+        n2 /= 10;
+        --frac2;
+    }
+
+    if (op == 0)
+        n1 &= n2;
+    else if (op == 1)
+        n1 |= n2;
+    else if (op == 2)
+        n1 ^= n2;
+    else if (op == 3)
+        n1 = ~n1;
+
+    while (n1 && n1 % 10 == 0) {
+        ++frac1;
+        n1 /= 10;
+    }
+
+    if (frac1 == -1) {
+        n1 *= 10;
+        --frac1;
+    }
+
+    return FP2INT(n1, frac1);
+}
+
+static int not(int a)
+{
+    int frac = GET_FRAC(a);
+    int n = GET_NUM(a);
+
+    return FP2INT(!n, frac);
 }
 
 /* TODO: change logic */
-uint64_t expr_eval(struct expr *e)
+int expr_eval(struct expr *e)
 {
-    uint64_t n;
+    int n;
     switch (e->type) {
     case OP_UNARY_MINUS: /* OK */
-        return minus(0, expr_eval(&e->param.op.args.buf[0]));
+        return minus(FP2INT(0, 0), expr_eval(&e->param.op.args.buf[0]));
     case OP_UNARY_LOGICAL_NOT: /* OK */
         return not(expr_eval(&e->param.op.args.buf[0]));
     case OP_UNARY_BITWISE_NOT: /* OK */
-        return ~expr_eval(&e->param.op.args.buf[0]);
+        return bitwise_op(expr_eval(&e->param.op.args.buf[0]), 0, 3);
     case OP_POWER:
         return power(expr_eval(&e->param.op.args.buf[0]),
                      expr_eval(&e->param.op.args.buf[1]));
@@ -404,29 +511,29 @@ uint64_t expr_eval(struct expr *e)
                               expr_eval(&e->param.op.args.buf[1])) &
                       (EQUAL)));
     case OP_BITWISE_AND: /* OK */
-        return expr_eval(&e->param.op.args.buf[0]) &
-               expr_eval(&e->param.op.args.buf[1]);
+        return (bitwise_op(expr_eval(&e->param.op.args.buf[0]),
+                           expr_eval(&e->param.op.args.buf[1]), 0));
     case OP_BITWISE_OR: /* OK */
-        return expr_eval(&e->param.op.args.buf[0]) |
-               expr_eval(&e->param.op.args.buf[1]);
+        return MASK(bitwise_op(expr_eval(&e->param.op.args.buf[0]),
+                               expr_eval(&e->param.op.args.buf[1]), 1));
     case OP_BITWISE_XOR: /* OK */
-        return expr_eval(&e->param.op.args.buf[0]) ^
-               expr_eval(&e->param.op.args.buf[1]);
+        return (bitwise_op(expr_eval(&e->param.op.args.buf[0]),
+                           expr_eval(&e->param.op.args.buf[1]), 2));
     case OP_LOGICAL_AND: /* OK */
         n = expr_eval(&e->param.op.args.buf[0]);
-        if (n) {
+        if (GET_NUM(n) != 0) {
             n = expr_eval(&e->param.op.args.buf[1]);
-            if (n)
+            if (GET_NUM(n) != 0)
                 return n;
         }
         return 0;
     case OP_LOGICAL_OR: /* OK */
         n = expr_eval(&e->param.op.args.buf[0]);
-        if (n && !isNan(n)) {
+        if (GET_NUM(n) != 0 && !isNan(n)) {
             return n;
         } else {
             n = expr_eval(&e->param.op.args.buf[1]);
-            if (n)
+            if (GET_NUM(n) != 0)
                 return n;
         }
         return 0;
@@ -561,7 +668,7 @@ static int expr_bind(const char *s, size_t len, vec_expr_t *es)
     return 0;
 }
 
-static struct expr expr_const(uint64_t value)
+static struct expr expr_const(int value)
 {
     struct expr e = expr_init();
     e.type = OP_CONST;
@@ -624,7 +731,7 @@ struct expr *expr_create(const char *s,
                          struct expr_var_list *vars,
                          struct expr_func *funcs)
 {
-    uint64_t num;
+    int num;
     struct expr_var *v;
     const char *id = NULL;
     size_t idn = 0;
